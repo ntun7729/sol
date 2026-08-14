@@ -1,0 +1,106 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: false
+
+      - name: Test
+        run: |
+          go mod tidy
+          go test ./...
+
+      - name: Build standalone binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in \
+            linux/amd64 \
+            linux/arm64 \
+            windows/amd64 \
+            windows/arm64 \
+            darwin/amd64 \
+            darwin/arm64
+          do
+            GOOS=${target%/*}
+            GOARCH=${target#*/}
+            EXT=''
+            if [ "$GOOS" = windows ]; then EXT='.exe'; fi
+            OUT="dist/sol-${GOOS}-${GOARCH}${EXT}"
+            echo "building $OUT"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+              go build -trimpath -ldflags='-s -w' -o "$OUT" ./cmd/sol
+          done
+          (
+            cd dist
+            sha256sum sol-* > SHA256SUMS.txt
+          )
+          ls -lh dist
+
+      - name: Publish v0.1.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG='v0.1.0'
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already exists; refusing to overwrite it."
+            exit 1
+          fi
+
+          cat >/tmp/release-notes.md <<'EOF'
+          First standalone release of sol.
+
+          This release contains prebuilt binaries, so Go is not required on the client machine.
+
+          Supported builds:
+          - Linux x86-64: `sol-linux-amd64`
+          - Linux ARM64: `sol-linux-arm64`
+          - Windows x86-64: `sol-windows-amd64.exe`
+          - Windows ARM64: `sol-windows-arm64.exe`
+          - macOS Intel: `sol-darwin-amd64`
+          - macOS Apple Silicon: `sol-darwin-arm64`
+
+          Client usage:
+
+          Linux/macOS:
+          ```sh
+          chmod +x ./sol-linux-amd64
+          SOL_SERVER_URL='wss://YOUR-SERVICE.onrender.com/ws' \
+          SOL_TOKEN='YOUR_SOL_TOKEN' \
+          ./sol-linux-amd64 client
+          ```
+
+          Windows PowerShell:
+          ```powershell
+          $env:SOL_SERVER_URL='wss://YOUR-SERVICE.onrender.com/ws'
+          $env:SOL_TOKEN='YOUR_SOL_TOKEN'
+          .\sol-windows-amd64.exe client
+          ```
+
+          The local SOCKS5 proxy listens on `127.0.0.1:1080` by default.
+
+          Verify downloads with `SHA256SUMS.txt`.
+          EOF
+
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title 'sol v0.1.0' \
+            --notes-file /tmp/release-notes.md
