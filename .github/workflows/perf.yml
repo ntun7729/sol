@@ -1,0 +1,238 @@
+name: perf
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/perf.yml'
+      - 'scripts/perf_server.py'
+      - 'cmd/sol/**'
+      - 'go.mod'
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: false
+      - name: Build
+        run: |
+          go mod tidy
+          CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o sol ./cmd/sol
+      - name: Run speed, streaming, and integrity tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TOKEN='0123456789abcdef0123456789abcdef'
+          ORIGIN='http://127.0.0.1:19090'
+          PROXY='socks5h://127.0.0.1:1080'
+          CF_DOWN='https://speed.cloudflare.com/__down?bytes=33554432'
+          CF_LAT='https://speed.cloudflare.com/__down?bytes=1'
+          CF_UP='https://speed.cloudflare.com/__up'
+
+          python3 scripts/perf_server.py --port 19090 >/tmp/perf-origin.log 2>&1 &
+          ORIGIN_PID=$!
+          SOL_TOKEN="$TOKEN" PORT=18080 ./sol server >/tmp/sol-server.log 2>&1 &
+          SERVER_PID=$!
+          SOL_SERVER_URL='ws://127.0.0.1:18080/ws' SOL_TOKEN="$TOKEN" SOL_LISTEN='127.0.0.1:1080' ./sol client >/tmp/sol-client.log 2>&1 &
+          CLIENT_PID=$!
+          trap 'kill "$CLIENT_PID" "$SERVER_PID" "$ORIGIN_PID" 2>/dev/null || true' EXIT
+
+          ready=0
+          for _ in $(seq 1 50); do
+            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1 && \
+               curl -fsSI --proxy "$PROXY" "$ORIGIN/" >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat /tmp/sol-server.log /tmp/sol-client.log /tmp/perf-origin.log || true
+            exit 1
+          fi
+
+          measure_download() {
+            local mode="$1" url="$2"
+            if [ "$mode" = proxy ]; then
+              curl -fsS --retry 2 --connect-timeout 10 --max-time 120 --proxy "$PROXY" -o /dev/null -w '%{speed_download}\n' "$url"
+            else
+              curl -fsS --retry 2 --connect-timeout 10 --max-time 120 -o /dev/null -w '%{speed_download}\n' "$url"
+            fi
+          }
+
+          measure_latency() {
+            local mode="$1" url="$2"
+            if [ "$mode" = proxy ]; then
+              curl -fsS --retry 1 --connect-timeout 10 --max-time 30 --proxy "$PROXY" -o /dev/null -w '%{time_total}\n' "$url"
+            else
+              curl -fsS --retry 1 --connect-timeout 10 --max-time 30 -o /dev/null -w '%{time_total}\n' "$url"
+            fi
+          }
+
+          measure_upload() {
+            local mode="$1"
+            if [ "$mode" = proxy ]; then
+              curl -fsS --retry 1 --connect-timeout 10 --max-time 120 --proxy "$PROXY" -o /dev/null -w '%{speed_upload}\n' --data-binary @/tmp/upload.bin "$CF_UP"
+            else
+              curl -fsS --retry 1 --connect-timeout 10 --max-time 120 -o /dev/null -w '%{speed_upload}\n' --data-binary @/tmp/upload.bin "$CF_UP"
+            fi
+          }
+
+          avg_mbps() {
+            awk '{s += ($1 * 8 / 1000000); n++} END {if (n) printf "%.2f", s/n; else print "0"}' "$1"
+          }
+
+          avg_ms() {
+            awk '{s += ($1 * 1000); n++} END {if (n) printf "%.2f", s/n; else print "0"}' "$1"
+          }
+
+          ratio_pct() {
+            awk -v a="$1" -v b="$2" 'BEGIN {if (a == 0) print "n/a"; else printf "%.1f%%", ((b-a)/a)*100}'
+          }
+
+          profile() {
+            awk -v speed="$1" -v need="$2" 'BEGIN {if (speed >= need) print "PASS"; else print "FAIL"}'
+          }
+
+          : >/tmp/local_direct
+          : >/tmp/local_proxy
+          for _ in 1 2; do
+            measure_download direct "$ORIGIN/blob?bytes=134217728" >>/tmp/local_direct
+            measure_download proxy  "$ORIGIN/blob?bytes=134217728" >>/tmp/local_proxy
+          done
+          LOCAL_DIRECT=$(avg_mbps /tmp/local_direct)
+          LOCAL_PROXY=$(avg_mbps /tmp/local_proxy)
+
+          curl -fsS "$ORIGIN/blob?bytes=33554432" -o /tmp/direct-integrity.bin
+          curl -fsS --proxy "$PROXY" "$ORIGIN/blob?bytes=33554432" -o /tmp/proxy-integrity.bin
+          DIRECT_SHA=$(sha256sum /tmp/direct-integrity.bin | awk '{print $1}')
+          PROXY_SHA=$(sha256sum /tmp/proxy-integrity.bin | awk '{print $1}')
+          [ "$DIRECT_SHA" = "$PROXY_SHA" ]
+
+          run_stream() {
+            local name="$1" mbps="$2" seconds="$3"
+            local expected elapsed actual delivered start_ns end_ns
+            expected=$(awk -v m="$mbps" -v s="$seconds" 'BEGIN {printf "%.0f", m*1000000/8*s}')
+            start_ns=$(date +%s%N)
+            curl -fsS --proxy "$PROXY" "$ORIGIN/stream?mbps=$mbps&seconds=$seconds" -o "/tmp/$name.bin"
+            end_ns=$(date +%s%N)
+            actual=$(stat -c %s "/tmp/$name.bin")
+            [ "$actual" -eq "$expected" ]
+            elapsed=$(awk -v a="$start_ns" -v b="$end_ns" 'BEGIN {printf "%.3f", (b-a)/1000000000}')
+            delivered=$(awk -v bytes="$actual" -v sec="$elapsed" 'BEGIN {printf "%.2f", bytes*8/1000000/sec}')
+            awk -v elapsed="$elapsed" -v planned="$seconds" 'BEGIN {exit !(elapsed <= planned*1.25)}'
+            printf '%s %s %s\n' "$elapsed" "$delivered" "$actual"
+          }
+
+          read STREAM1080_SEC STREAM1080_MBPS STREAM1080_BYTES < <(run_stream stream1080 8 15)
+          read STREAM4K_SEC STREAM4K_MBPS STREAM4K_BYTES < <(run_stream stream4k 25 15)
+
+          CONCURRENT_START=$(date +%s%N)
+          pids=()
+          for i in 1 2 3 4; do
+            curl -fsS --proxy "$PROXY" "$ORIGIN/stream?mbps=8&seconds=15" -o "/tmp/concurrent-$i.bin" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do wait "$pid"; done
+          CONCURRENT_END=$(date +%s%N)
+          CONCURRENT_BYTES=0
+          for i in 1 2 3 4; do
+            size=$(stat -c %s "/tmp/concurrent-$i.bin")
+            [ "$size" -eq 15000000 ]
+            CONCURRENT_BYTES=$((CONCURRENT_BYTES + size))
+          done
+          CONCURRENT_SEC=$(awk -v a="$CONCURRENT_START" -v b="$CONCURRENT_END" 'BEGIN {printf "%.3f", (b-a)/1000000000}')
+          CONCURRENT_MBPS=$(awk -v bytes="$CONCURRENT_BYTES" -v sec="$CONCURRENT_SEC" 'BEGIN {printf "%.2f", bytes*8/1000000/sec}')
+          awk -v elapsed="$CONCURRENT_SEC" 'BEGIN {exit !(elapsed <= 18.75)}'
+
+          : >/tmp/pub_direct_lat
+          : >/tmp/pub_proxy_lat
+          for _ in $(seq 1 10); do
+            measure_latency direct "$CF_LAT" >>/tmp/pub_direct_lat
+            measure_latency proxy "$CF_LAT" >>/tmp/pub_proxy_lat
+          done
+          PUBLIC_DIRECT_LAT=$(avg_ms /tmp/pub_direct_lat)
+          PUBLIC_PROXY_LAT=$(avg_ms /tmp/pub_proxy_lat)
+
+          : >/tmp/pub_direct_down
+          : >/tmp/pub_proxy_down
+          for _ in 1 2 3; do
+            measure_download direct "$CF_DOWN" >>/tmp/pub_direct_down
+            measure_download proxy "$CF_DOWN" >>/tmp/pub_proxy_down
+          done
+          PUBLIC_DIRECT_DOWN=$(avg_mbps /tmp/pub_direct_down)
+          PUBLIC_PROXY_DOWN=$(avg_mbps /tmp/pub_proxy_down)
+
+          dd if=/dev/zero of=/tmp/upload.bin bs=1M count=16 status=none
+          : >/tmp/pub_direct_up
+          : >/tmp/pub_proxy_up
+          for _ in 1 2; do
+            measure_upload direct >>/tmp/pub_direct_up
+            measure_upload proxy >>/tmp/pub_proxy_up
+          done
+          PUBLIC_DIRECT_UP=$(avg_mbps /tmp/pub_direct_up)
+          PUBLIC_PROXY_UP=$(avg_mbps /tmp/pub_proxy_up)
+
+          STREAM_1080_PUBLIC=$(profile "$PUBLIC_PROXY_DOWN" 8)
+          STREAM_4K_PUBLIC=$(profile "$PUBLIC_PROXY_DOWN" 25)
+
+          cat >perf-results.md <<EOF
+          # sol performance results
+
+          GitHub Actions runner: ubuntu-latest
+          Transport under test: SOCKS5 -> WebSocket -> sol server -> TCP target
+
+          ## Throughput
+
+          | Test | Direct | SOCKS5/WebSocket | Proxy delta |
+          |---|---:|---:|---:|
+          | Local 128 MiB bulk download (2-run avg) | ${LOCAL_DIRECT} Mbps | ${LOCAL_PROXY} Mbps | $(ratio_pct "$LOCAL_DIRECT" "$LOCAL_PROXY") |
+          | Cloudflare 32 MiB download (3-run avg) | ${PUBLIC_DIRECT_DOWN} Mbps | ${PUBLIC_PROXY_DOWN} Mbps | $(ratio_pct "$PUBLIC_DIRECT_DOWN" "$PUBLIC_PROXY_DOWN") |
+          | Cloudflare 16 MiB upload (2-run avg) | ${PUBLIC_DIRECT_UP} Mbps | ${PUBLIC_PROXY_UP} Mbps | $(ratio_pct "$PUBLIC_DIRECT_UP" "$PUBLIC_PROXY_UP") |
+
+          ## Latency
+
+          | Test | Direct | SOCKS5/WebSocket | Added latency |
+          |---|---:|---:|---:|
+          | Cloudflare 1-byte HTTPS request (10-run avg) | ${PUBLIC_DIRECT_LAT} ms | ${PUBLIC_PROXY_LAT} ms | $(awk -v a="$PUBLIC_DIRECT_LAT" -v b="$PUBLIC_PROXY_LAT" 'BEGIN {printf "%.2f ms", b-a}') |
+
+          ## Streaming-like sustained transfer
+
+          | Profile | Target | Delivered | Completion | Result |
+          |---|---:|---:|---:|---|
+          | 1080p synthetic | 8 Mbps for 15 s | ${STREAM1080_MBPS} Mbps | ${STREAM1080_SEC} s | PASS |
+          | 4K synthetic | 25 Mbps for 15 s | ${STREAM4K_MBPS} Mbps | ${STREAM4K_SEC} s | PASS |
+          | 4 concurrent 1080p streams | 32 Mbps aggregate for 15 s | ${CONCURRENT_MBPS} Mbps | ${CONCURRENT_SEC} s | PASS |
+
+          Public-proxy bandwidth classification from the Cloudflare download measurement:
+          - 8 Mbps profile: ${STREAM_1080_PUBLIC}
+          - 25 Mbps profile: ${STREAM_4K_PUBLIC}
+
+          ## Integrity
+
+          32 MiB direct SHA-256: `${DIRECT_SHA}`
+
+          32 MiB SOCKS/WebSocket SHA-256: `${PROXY_SHA}`
+
+          Integrity result: PASS (hashes match)
+
+          ## Scope note
+
+          This run exercises the complete SOCKS5/WebSocket protocol and real public Internet egress on one GitHub Actions runner. It does not include the additional client-to-Render WAN hop or Render Free cold-start behavior; those require a deployed Render service URL/token.
+          EOF
+
+          cat perf-results.md
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results
+          path: perf-results.md
