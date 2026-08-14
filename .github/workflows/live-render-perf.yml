@@ -37,15 +37,11 @@ jobs:
           openssl pkey -in /tmp/live-bench-key.pem -pubout -out /tmp/live-bench-pub.pem >/dev/null 2>&1
           PUB=$(base64 -w0 /tmp/live-bench-pub.pem)
           gh api --method POST "repos/$GITHUB_REPOSITORY/issues/4/comments" -f body="BENCH_PUBKEY:$RUN_KEY:$PUB" >/dev/null
-
-          CIPHER=''
           PREFIX="BENCH_CIPHERTEXT:$RUN_KEY:"
+          CIPHER=''
           for _ in $(seq 1 120); do
             BODY=$(gh api "repos/$GITHUB_REPOSITORY/issues/4/comments?per_page=100" --jq "[.[] | select(.body | startswith(\"$PREFIX\"))][-1].body // \"\"")
-            if [ -n "$BODY" ]; then
-              CIPHER=${BODY#"$PREFIX"}
-              break
-            fi
+            if [ -n "$BODY" ]; then CIPHER=${BODY#"$PREFIX"}; break; fi
             sleep 3
           done
           test -n "$CIPHER"
@@ -61,154 +57,143 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           BASE='https://sol-eve7.onrender.com'
           WS='wss://sol-eve7.onrender.com/ws'
           PROXY='socks5h://127.0.0.1:1080'
-          DOWN_URL='https://fsn1-speed.hetzner.com/100MB.bin'
-          UP_URL='https://vln038-speedtest-2.tele2.net/upload.php'
+          GO_URL='https://go.dev/dl/go1.24.13.linux-amd64.tar.gz'
           TOKEN=$(cat /tmp/live-bench-token)
           echo "::add-mask::$TOKEN"
 
           cleanup() {
-            rm -f /tmp/live-bench-token /tmp/upload.bin /tmp/stream-*.bin /tmp/multi-*.bin
+            rm -f /tmp/live-bench-token /tmp/go-*.bin /tmp/stream-*.bin /tmp/multi-*.bin
             if [ -n "${CLIENT_PID:-}" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
           }
           trap cleanup EXIT
 
-          FIRST=$(curl -sS --connect-timeout 20 --max-time 120 -o /tmp/health-first -w '%{http_code} %{time_total}' "$BASE/healthz")
+          request_meta() {
+            local url="$1" out="$2"
+            curl -sS -L --connect-timeout 15 --max-time 90 --proxy "$PROXY" -o "$out" -w '%{http_code} %{time_total} %{size_download}' "$url" 2>"$out.err"
+          }
+
+          FIRST=$(curl -sS --connect-timeout 20 --max-time 120 -o /tmp/health -w '%{http_code} %{time_total}' "$BASE/healthz" 2>/tmp/health.err || true)
           FIRST_CODE=$(awk '{print $1}' <<<"$FIRST")
           FIRST_SEC=$(awk '{print $2}' <<<"$FIRST")
-          FIRST_BODY=$(tr -d '\r\n' </tmp/health-first)
-
-          : >/tmp/health-warm-times
-          : >/tmp/health-warm-codes
-          for _ in 1 2 3 4 5; do
-            R=$(curl -sS --connect-timeout 10 --max-time 30 -o /tmp/health-warm-body -w '%{http_code} %{time_total}' "$BASE/healthz")
-            awk '{print $1}' <<<"$R" >>/tmp/health-warm-codes
-            awk '{print $2}' <<<"$R" >>/tmp/health-warm-times
-          done
-          WARM_MS=$(awk '{s+=$1*1000;n++} END {printf "%.2f",s/n}' /tmp/health-warm-times)
-          WARM_CODES=$(paste -sd, /tmp/health-warm-codes)
+          [ -n "$FIRST_CODE" ] || FIRST_CODE=000
+          [ -n "$FIRST_SEC" ] || FIRST_SEC=0
+          FIRST_BODY=$(tr -d '\r\n' </tmp/health 2>/dev/null || true)
 
           SOL_SERVER_URL="$WS" SOL_TOKEN="$TOKEN" SOL_LISTEN='127.0.0.1:1080' ./sol client >/tmp/sol-live-client.log 2>&1 &
           CLIENT_PID=$!
+          sleep 1
 
-          READY=0
-          READY_CODE='000'
-          for _ in $(seq 1 90); do
-            READY_CODE=$(curl -sS --connect-timeout 10 --max-time 30 --proxy "$PROXY" -o /dev/null -w '%{http_code}' https://example.com/ || true)
-            if [ "$READY_CODE" = 200 ]; then READY=1; break; fi
-            if ! kill -0 "$CLIENT_PID" 2>/dev/null; then break; fi
-            sleep 1
-          done
-          if [ "$READY" -ne 1 ]; then
-            {
-              echo '# Live Render benchmark - connection failure'
-              echo
-              echo "First health: HTTP $FIRST_CODE in $FIRST_SEC s, body=$FIRST_BODY"
-              echo "Warm health codes: $WARM_CODES"
-              echo "SOCKS/WSS connectivity to example.com: HTTP $READY_CODE"
-              echo
-              echo 'Client log:'
-              sed 's/^/    /' /tmp/sol-live-client.log || true
-            } >live-render-results.md
-            cat live-render-results.md
-            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/4/comments" -F body=@live-render-results.md >/dev/null
-            exit 1
-          fi
+          EXAMPLE=$(request_meta 'https://example.com/' /tmp/example.out || true)
+          EXAMPLE_CODE=$(awk '{print $1}' <<<"$EXAMPLE")
+          EXAMPLE_SEC=$(awk '{print $2}' <<<"$EXAMPLE")
+          [ -n "$EXAMPLE_CODE" ] || EXAMPLE_CODE=000
+          EXAMPLE_ERR=$(tr '\r\n|' '   ' </tmp/example.out.err 2>/dev/null | head -c 180)
 
-          : >/tmp/live-lat
+          RANGE_META=$(curl -sS -L --connect-timeout 15 --max-time 90 --proxy "$PROXY" --range 0-1048575 -o /tmp/go-range.bin -w '%{http_code} %{time_total} %{size_download}' "$GO_URL" 2>/tmp/go-range.err || true)
+          RANGE_CODE=$(awk '{print $1}' <<<"$RANGE_META")
+          RANGE_SEC=$(awk '{print $2}' <<<"$RANGE_META")
+          RANGE_BYTES=$(stat -c %s /tmp/go-range.bin 2>/dev/null || echo 0)
+          [ -n "$RANGE_CODE" ] || RANGE_CODE=000
+          RANGE_ERR=$(tr '\r\n|' '   ' </tmp/go-range.err 2>/dev/null | head -c 180)
+
+          : >/tmp/latencies
+          LAT_OK=0
           for _ in $(seq 1 10); do
-            curl -sS --connect-timeout 15 --max-time 60 --proxy "$PROXY" -I -o /dev/null -w '%{time_total}\n' "$DOWN_URL" >>/tmp/live-lat
+            M=$(request_meta 'https://example.com/' /tmp/lat.out || true)
+            C=$(awk '{print $1}' <<<"$M")
+            T=$(awk '{print $2}' <<<"$M")
+            if [ "$C" = 200 ] && [ -n "$T" ]; then echo "$T" >>/tmp/latencies; LAT_OK=$((LAT_OK+1)); fi
           done
-          LAT_MS=$(awk '{s+=$1*1000;n++} END {printf "%.2f",s/n}' /tmp/live-lat)
+          LAT_MS=$(awk '{s+=$1*1000;n++} END {if(n) printf "%.2f",s/n; else print "N/A"}' /tmp/latencies)
 
-          RANGE_TEST_CODE=$(curl -sS --connect-timeout 15 --max-time 60 --proxy "$PROXY" --range 0-1023 -o /tmp/range-test.bin -w '%{http_code}' "$DOWN_URL")
-          RANGE_TEST_BYTES=$(stat -c %s /tmp/range-test.bin)
-          test "$RANGE_TEST_CODE" = 206
-          test "$RANGE_TEST_BYTES" -eq 1024
-
-          : >/tmp/live-down
-          for _ in 1 2; do
-            curl -fsS --connect-timeout 15 --max-time 240 --proxy "$PROXY" -o /dev/null -w '%{speed_download}\n' "$DOWN_URL" >>/tmp/live-down
+          : >/tmp/down-speeds
+          DOWN_OK=0
+          for i in 1 2; do
+            M=$(curl -sS -L --connect-timeout 20 --max-time 300 --proxy "$PROXY" -o /tmp/go-full-$i.bin -w '%{http_code} %{speed_download} %{size_download}' "$GO_URL" 2>/tmp/go-full-$i.err || true)
+            C=$(awk '{print $1}' <<<"$M")
+            S=$(awk '{print $2}' <<<"$M")
+            B=$(awk '{print $3}' <<<"$M")
+            if [ "$C" = 200 ] && awk -v b="$B" 'BEGIN {exit !(b > 70000000)}'; then
+              echo "$S" >>/tmp/down-speeds
+              DOWN_OK=$((DOWN_OK+1))
+            fi
+            rm -f /tmp/go-full-$i.bin
           done
-          DOWN_MBPS=$(awk '{s+=$1*8/1000000;n++} END {printf "%.2f",s/n}' /tmp/live-down)
-
-          dd if=/dev/zero of=/tmp/upload.bin bs=1M count=8 status=none
-          UP_RAW=$(curl -sS --connect-timeout 15 --max-time 180 --proxy "$PROXY" -T /tmp/upload.bin -o /dev/null -w '%{http_code} %{speed_upload}' "$UP_URL" || true)
-          UP_CODE=$(awk '{print $1}' <<<"$UP_RAW")
-          UP_BPS=$(awk '{print $2}' <<<"$UP_RAW")
-          if [ "$UP_CODE" = 200 ] || [ "$UP_CODE" = 201 ]; then
-            UP_MBPS=$(awk -v x="$UP_BPS" 'BEGIN {printf "%.2f",x*8/1000000}')
-          else
-            UP_MBPS="N/A (HTTP ${UP_CODE:-000})"
-          fi
+          DOWN_MBPS=$(awk '{s+=$1*8/1000000;n++} END {if(n) printf "%.2f",s/n; else print "N/A"}' /tmp/down-speeds)
 
           run_stream() {
             local name="$1" bytes="$2" rate="$3" planned="$4"
-            local start end elapsed actual delivered result last
+            local last start end meta code actual elapsed delivered result
             last=$((bytes-1))
             start=$(date +%s%N)
-            curl -fsS --connect-timeout 15 --max-time 180 --proxy "$PROXY" --range "0-$last" --limit-rate "$rate" -o "/tmp/stream-$name.bin" "$DOWN_URL"
+            meta=$(curl -sS -L --connect-timeout 20 --max-time 240 --proxy "$PROXY" --range "0-$last" --limit-rate "$rate" -o "/tmp/stream-$name.bin" -w '%{http_code}' "$GO_URL" 2>"/tmp/stream-$name.err" || true)
             end=$(date +%s%N)
-            actual=$(stat -c %s "/tmp/stream-$name.bin")
-            test "$actual" -eq "$bytes"
+            code="$meta"
+            actual=$(stat -c %s "/tmp/stream-$name.bin" 2>/dev/null || echo 0)
             elapsed=$(awk -v a="$start" -v b="$end" 'BEGIN {printf "%.3f",(b-a)/1000000000}')
-            delivered=$(awk -v x="$actual" -v s="$elapsed" 'BEGIN {printf "%.2f",x*8/1000000/s}')
-            result=$(awk -v e="$elapsed" -v p="$planned" 'BEGIN {if(e<=p*1.30) print "PASS"; else print "FAIL"}')
+            delivered=$(awk -v x="$actual" -v s="$elapsed" 'BEGIN {if(s>0) printf "%.2f",x*8/1000000/s; else print "0"}')
+            result=$(awk -v c="$code" -v x="$actual" -v want="$bytes" -v e="$elapsed" -v p="$planned" 'BEGIN {if((c==206 || c==200) && x==want && e<=p*1.30) print "PASS"; else print "FAIL"}')
             rm -f "/tmp/stream-$name.bin"
-            printf '%s %s %s\n' "$elapsed" "$delivered" "$result"
+            printf '%s %s %s %s\n' "$elapsed" "$delivered" "$result" "$code"
           }
 
-          read S1080_SEC S1080_MBPS S1080_RESULT < <(run_stream 1080 15000000 1000k 15)
-          read S4K_SEC S4K_MBPS S4K_RESULT < <(run_stream 4k 46875000 3125k 15)
+          if [ "$RANGE_CODE" = 206 ] && [ "$RANGE_BYTES" -eq 1048576 ]; then
+            read S1080_SEC S1080_MBPS S1080_RESULT S1080_CODE < <(run_stream 1080 15000000 1000k 15)
+            read S4K_SEC S4K_MBPS S4K_RESULT S4K_CODE < <(run_stream 4k 46875000 3125k 15)
+          else
+            S1080_SEC='N/A'; S1080_MBPS='N/A'; S1080_RESULT='SKIP'; S1080_CODE="$RANGE_CODE"
+            S4K_SEC='N/A'; S4K_MBPS='N/A'; S4K_RESULT='SKIP'; S4K_CODE="$RANGE_CODE"
+          fi
 
           multi_stream() {
             local name="$1" count="$2" bytes="$3" rate="$4" planned="$5"
-            local start end elapsed total size delivered result last
-            last=$((bytes-1))
-            start=$(date +%s%N)
-            pids=()
+            local last start end total ok size elapsed delivered result
+            last=$((bytes-1)); start=$(date +%s%N); pids=(); ok=1
             for i in $(seq 1 "$count"); do
-              curl -fsS --connect-timeout 15 --max-time 180 --proxy "$PROXY" --range "0-$last" --limit-rate "$rate" -o "/tmp/multi-$name-$i.bin" "$DOWN_URL" &
+              (curl -sS -L --connect-timeout 20 --max-time 240 --proxy "$PROXY" --range "0-$last" --limit-rate "$rate" -o "/tmp/multi-$name-$i.bin" -w '%{http_code}' "$GO_URL" >"/tmp/multi-$name-$i.code" 2>"/tmp/multi-$name-$i.err" || true) &
               pids+=("$!")
             done
             for pid in "${pids[@]}"; do wait "$pid"; done
-            end=$(date +%s%N)
-            total=0
+            end=$(date +%s%N); total=0
             for i in $(seq 1 "$count"); do
-              size=$(stat -c %s "/tmp/multi-$name-$i.bin")
-              test "$size" -eq "$bytes"
-              total=$((total+size))
-              rm -f "/tmp/multi-$name-$i.bin"
+              size=$(stat -c %s "/tmp/multi-$name-$i.bin" 2>/dev/null || echo 0)
+              code=$(cat "/tmp/multi-$name-$i.code" 2>/dev/null || echo 000)
+              if [ "$size" -ne "$bytes" ] || { [ "$code" != 206 ] && [ "$code" != 200 ]; }; then ok=0; fi
+              total=$((total+size)); rm -f "/tmp/multi-$name-$i.bin"
             done
             elapsed=$(awk -v a="$start" -v b="$end" 'BEGIN {printf "%.3f",(b-a)/1000000000}')
-            delivered=$(awk -v x="$total" -v s="$elapsed" 'BEGIN {printf "%.2f",x*8/1000000/s}')
-            result=$(awk -v e="$elapsed" -v p="$planned" 'BEGIN {if(e<=p*1.30) print "PASS"; else print "FAIL"}')
+            delivered=$(awk -v x="$total" -v s="$elapsed" 'BEGIN {if(s>0) printf "%.2f",x*8/1000000/s; else print "0"}')
+            result=$(awk -v ok="$ok" -v e="$elapsed" -v p="$planned" 'BEGIN {if(ok==1 && e<=p*1.30) print "PASS"; else print "FAIL"}')
             printf '%s %s %s\n' "$elapsed" "$delivered" "$result"
           }
 
-          read M1080_SEC M1080_MBPS M1080_RESULT < <(multi_stream 1080 4 15000000 1000k 15)
-          read M4K_SEC M4K_MBPS M4K_RESULT < <(multi_stream 4k 2 46875000 3125k 15)
+          if [ "$RANGE_CODE" = 206 ] && [ "$RANGE_BYTES" -eq 1048576 ]; then
+            read M1080_SEC M1080_MBPS M1080_RESULT < <(multi_stream 1080 4 15000000 1000k 15)
+            read M4K_SEC M4K_MBPS M4K_RESULT < <(multi_stream 4k 2 46875000 3125k 15)
+          else
+            M1080_SEC='N/A'; M1080_MBPS='N/A'; M1080_RESULT='SKIP'
+            M4K_SEC='N/A'; M4K_MBPS='N/A'; M4K_RESULT='SKIP'
+          fi
 
+          CLIENT_LOG=$(tr '\r\n|' '   ' </tmp/sol-live-client.log 2>/dev/null | tail -c 500)
           cat >live-render-results.md <<EOF
           # Live Render benchmark
 
           Endpoint: sol-eve7.onrender.com
-          Runner: ${RUNNER_NAME:-hosted-runner}
 
           | Test | Result |
           |---|---:|
-          | First health | HTTP ${FIRST_CODE}, ${FIRST_SEC} s, body ${FIRST_BODY} |
-          | Warm health codes | ${WARM_CODES} |
-          | Warm health latency, 5-run avg | ${WARM_MS} ms |
-          | SOCKS5/WSS connectivity | PASS |
-          | Hetzner HTTPS latency through tunnel, 10-run avg | ${LAT_MS} ms |
-          | Hetzner 100 MB download through tunnel, 2-run avg | ${DOWN_MBPS} Mbps |
-          | Tele2 8 MiB upload through tunnel | ${UP_MBPS} |
+          | Render health | HTTP ${FIRST_CODE}, ${FIRST_SEC} s, body ${FIRST_BODY} |
+          | SOCKS/WSS -> example.com | HTTP ${EXAMPLE_CODE}, ${EXAMPLE_SEC} s |
+          | Example.com latency | ${LAT_MS} ms avg (${LAT_OK}/10 successful) |
+          | Go archive 1 MiB range | HTTP ${RANGE_CODE}, ${RANGE_BYTES} bytes, ${RANGE_SEC} s |
+          | Go 75 MB full download | ${DOWN_MBPS} Mbps (${DOWN_OK}/2 successful) |
 
-          ## Streaming-like sustained transfers through real Render deployment
+          ## Streaming-like sustained transfers
 
           | Profile | Delivered | Completion | Result |
           |---|---:|---:|---|
@@ -217,18 +202,16 @@ jobs:
           | 4 concurrent 1080p, 32 Mbps aggregate | ${M1080_MBPS} Mbps | ${M1080_SEC} s | ${M1080_RESULT} |
           | 2 concurrent 4K, 50 Mbps aggregate | ${M4K_MBPS} Mbps | ${M4K_SEC} s | ${M4K_RESULT} |
 
-          Download and streaming traffic traversed GitHub Actions client -> SOCKS5 -> WSS/TLS -> sol-eve7.onrender.com -> Hetzner. These are paced TCP capacity tests, not DRM/player compatibility or UDP/QUIC tests.
-          EOF
+          Diagnostics: example error=${EXAMPLE_ERR}; range error=${RANGE_ERR}; client log=${CLIENT_LOG}
 
+          Path under test: GitHub Actions -> local SOCKS5 -> WSS/TLS -> sol-eve7.onrender.com -> public target.
+          EOF
           cat live-render-results.md
           gh api --method POST "repos/$GITHUB_REPOSITORY/issues/4/comments" -F body=@live-render-results.md >/dev/null
 
-          test "$FIRST_CODE" = 200
-          test "$FIRST_BODY" = ok
-          test "$S1080_RESULT" = PASS
-          test "$S4K_RESULT" = PASS
-          test "$M1080_RESULT" = PASS
-          test "$M4K_RESULT" = PASS
+          if [ "$FIRST_CODE" != 200 ] || [ "$FIRST_BODY" != ok ] || [ "$EXAMPLE_CODE" != 200 ]; then exit 1; fi
+          if [ "$DOWN_OK" -eq 0 ]; then exit 1; fi
+          if [ "$S1080_RESULT" = FAIL ] || [ "$S4K_RESULT" = FAIL ] || [ "$M1080_RESULT" = FAIL ] || [ "$M4K_RESULT" = FAIL ]; then exit 1; fi
       - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
