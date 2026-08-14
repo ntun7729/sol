@@ -1,0 +1,65 @@
+name: render-smoke
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/render-smoke.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe deployed service
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -u
+          BASE='https://sol-eve7.onrender.com'
+          : >render-smoke-results.md
+          {
+            echo '# Render deployment smoke test'
+            echo
+            echo '| Attempt | Path | curl exit | HTTP | Total time | Body |'
+            echo '|---:|---|---:|---:|---:|---|'
+          } >>render-smoke-results.md
+
+          probe() {
+            n="$1" path="$2"
+            body="/tmp/body-$n-$(echo "$path" | tr '/' '_')"
+            set +e
+            meta=$(curl -sS --connect-timeout 20 --max-time 90 -o "$body" -w '%{http_code} %{time_total}' "$BASE$path" 2>"$body.err")
+            rc=$?
+            set -e
+            code=$(awk '{print $1}' <<<"$meta")
+            sec=$(awk '{print $2}' <<<"$meta")
+            [ -n "$code" ] || code=000
+            [ -n "$sec" ] || sec=0
+            text=$(tr '\r\n|' '   ' <"$body" 2>/dev/null | head -c 160)
+            err=$(tr '\r\n|' '   ' <"$body.err" 2>/dev/null | head -c 160)
+            if [ -z "$text" ]; then text="$err"; fi
+            printf '| %s | `%s` | %s | %s | %s s | %s |\n' "$n" "$path" "$rc" "$code" "$sec" "$text" >>render-smoke-results.md
+          }
+
+          for n in 1 2 3; do
+            probe "$n" '/healthz'
+            probe "$n" '/'
+            probe "$n" '/ws'
+            sleep 3
+          done
+
+          echo >>render-smoke-results.md
+          echo 'Expected healthy behavior: `/healthz` = 200 with `ok`; `/` = 200; `/ws` without a bearer token = 401.' >>render-smoke-results.md
+          cat render-smoke-results.md
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/4/comments" -F body=@render-smoke-results.md >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: render-smoke-results
+          path: render-smoke-results.md
