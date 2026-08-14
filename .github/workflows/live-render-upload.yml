@@ -1,0 +1,94 @@
+name: live-render-upload
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/live-render-upload.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: false
+      - name: Build
+        run: |
+          go mod tidy
+          CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o sol ./cmd/sol
+      - name: Secure token handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_KEY="$GITHUB_RUN_ID"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /tmp/key.pem >/dev/null 2>&1
+          openssl pkey -in /tmp/key.pem -pubout -out /tmp/pub.pem >/dev/null 2>&1
+          PUB=$(base64 -w0 /tmp/pub.pem)
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/4/comments" -f body="BENCH_PUBKEY:$RUN_KEY:$PUB" >/dev/null
+          PREFIX="BENCH_CIPHERTEXT:$RUN_KEY:"
+          CIPHER=''
+          for _ in $(seq 1 120); do
+            BODY=$(gh api "repos/$GITHUB_REPOSITORY/issues/4/comments?per_page=100" --jq "[.[] | select(.body | startswith(\"$PREFIX\"))][-1].body // \"\"")
+            if [ -n "$BODY" ]; then CIPHER=${BODY#"$PREFIX"}; break; fi
+            sleep 3
+          done
+          test -n "$CIPHER"
+          printf '%s' "$CIPHER" | base64 -d >/tmp/token.enc
+          TOKEN=$(openssl pkeyutl -decrypt -inkey /tmp/key.pem -in /tmp/token.enc -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256)
+          echo "::add-mask::$TOKEN"
+          printf '%s' "$TOKEN" >/tmp/token
+          chmod 600 /tmp/token
+          rm -f /tmp/key.pem /tmp/pub.pem /tmp/token.enc
+      - name: Upload test through live Render tunnel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKEN=$(cat /tmp/token)
+          echo "::add-mask::$TOKEN"
+          SOL_SERVER_URL='wss://sol-eve7.onrender.com/ws' SOL_TOKEN="$TOKEN" SOL_LISTEN='127.0.0.1:1080' ./sol client >/tmp/client.log 2>&1 &
+          CLIENT_PID=$!
+          trap 'kill "$CLIENT_PID" 2>/dev/null || true; rm -f /tmp/token /tmp/upload.bin' EXIT
+          sleep 1
+          curl -fsS --proxy socks5h://127.0.0.1:1080 https://example.com/ -o /dev/null
+          dd if=/dev/zero of=/tmp/upload.bin bs=1M count=8 status=none
+          : >/tmp/up
+          : >/tmp/codes
+          for _ in 1 2; do
+            M=$(curl -sS --connect-timeout 20 --max-time 180 --proxy socks5h://127.0.0.1:1080 -T /tmp/upload.bin -o /dev/null -w '%{http_code} %{speed_upload}' http://speedtest.tele2.net/upload.php)
+            echo "$M"
+            C=$(awk '{print $1}' <<<"$M")
+            S=$(awk '{print $2}' <<<"$M")
+            echo "$C" >>/tmp/codes
+            if [ "$C" = 200 ] || [ "$C" = 201 ]; then echo "$S" >>/tmp/up; fi
+          done
+          UP=$(awk '{s+=$1*8/1000000;n++} END {if(n) printf "%.2f",s/n; else print "N/A"}' /tmp/up)
+          CODES=$(paste -sd, /tmp/codes)
+          cat >live-render-upload-results.md <<EOF
+          # Live Render upload benchmark
+
+          Endpoint: sol-eve7.onrender.com
+
+          - Tele2 HTTP upload, 8 MiB x2 through SOCKS5/WSS: **${UP} Mbps**
+          - HTTP result codes: ${CODES}
+          EOF
+          cat live-render-upload-results.md
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/4/comments" -F body=@live-render-upload-results.md >/dev/null
+          test "$UP" != N/A
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-render-upload-results
+          path: live-render-upload-results.md
+          if-no-files-found: ignore
