@@ -1,0 +1,200 @@
+name: render-free-perf
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/render-free-perf.yml'
+      - 'Dockerfile'
+      - 'cmd/sol/**'
+      - 'go.mod'
+
+permissions:
+  contents: read
+
+jobs:
+  render-free-sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: false
+      - name: Build binary and image
+        run: |
+          go mod tidy
+          CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o sol ./cmd/sol
+          docker build -t sol:render-free-sim .
+      - name: Benchmark at Render Free CPU and RAM limits
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKEN='0123456789abcdef0123456789abcdef'
+          ORIGIN='http://127.0.0.1:19090'
+          PROXY='socks5h://127.0.0.1:1080'
+          CF_DOWN='https://speed.cloudflare.com/__down?bytes=33554432'
+          CF_LAT='https://speed.cloudflare.com/__down?bytes=1'
+          CF_UP='https://speed.cloudflare.com/__up'
+
+          python3 scripts/perf_server.py --port 19090 >/tmp/perf-origin.log 2>&1 &
+          ORIGIN_PID=$!
+          docker run -d --rm --name sol-render-sim --network host \
+            --cpus=0.1 --memory=512m \
+            -e SOL_TOKEN="$TOKEN" -e PORT=18080 \
+            sol:render-free-sim server >/tmp/container-id
+          SOL_SERVER_URL='ws://127.0.0.1:18080/ws' SOL_TOKEN="$TOKEN" SOL_LISTEN='127.0.0.1:1080' ./sol client >/tmp/sol-client.log 2>&1 &
+          CLIENT_PID=$!
+          trap 'kill "$CLIENT_PID" "$ORIGIN_PID" 2>/dev/null || true; docker rm -f sol-render-sim >/dev/null 2>&1 || true' EXIT
+
+          ready=0
+          for _ in $(seq 1 100); do
+            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1 && \
+               curl -fsSI --proxy "$PROXY" "$ORIGIN/" >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          [ "$ready" -eq 1 ] || { docker logs sol-render-sim; cat /tmp/sol-client.log; exit 1; }
+
+          NANO_CPUS=$(docker inspect sol-render-sim --format '{{.HostConfig.NanoCpus}}')
+          MEMORY_LIMIT=$(docker inspect sol-render-sim --format '{{.HostConfig.Memory}}')
+          [ "$NANO_CPUS" -eq 100000000 ]
+          [ "$MEMORY_LIMIT" -eq 536870912 ]
+
+          download_bps() {
+            curl -fsS --retry 2 --connect-timeout 10 --max-time 180 --proxy "$PROXY" -o /dev/null -w '%{speed_download}\n' "$1"
+          }
+          latency_s() {
+            curl -fsS --retry 1 --connect-timeout 10 --max-time 30 --proxy "$PROXY" -o /dev/null -w '%{time_total}\n' "$1"
+          }
+          upload_bps() {
+            curl -fsS --retry 1 --connect-timeout 10 --max-time 180 --proxy "$PROXY" -o /dev/null -w '%{speed_upload}\n' --data-binary @/tmp/upload.bin "$CF_UP"
+          }
+          avg_mbps() {
+            awk '{s += ($1*8/1000000); n++} END {printf "%.2f", s/n}' "$1"
+          }
+          avg_ms() {
+            awk '{s += ($1*1000); n++} END {printf "%.2f", s/n}' "$1"
+          }
+          profile() {
+            awk -v speed="$1" -v need="$2" 'BEGIN {if (speed >= need) print "PASS"; else print "FAIL"}'
+          }
+
+          : >/tmp/local_down
+          for _ in 1 2; do download_bps "$ORIGIN/blob?bytes=134217728" >>/tmp/local_down; done
+          LOCAL_DOWN=$(avg_mbps /tmp/local_down)
+
+          curl -fsS "$ORIGIN/blob?bytes=33554432" -o /tmp/direct-integrity.bin
+          curl -fsS --proxy "$PROXY" "$ORIGIN/blob?bytes=33554432" -o /tmp/proxy-integrity.bin
+          DIRECT_SHA=$(sha256sum /tmp/direct-integrity.bin | awk '{print $1}')
+          PROXY_SHA=$(sha256sum /tmp/proxy-integrity.bin | awk '{print $1}')
+          [ "$DIRECT_SHA" = "$PROXY_SHA" ]
+
+          run_stream() {
+            local name="$1" mbps="$2" seconds="$3"
+            local expected start_ns end_ns actual elapsed delivered
+            expected=$(awk -v m="$mbps" -v s="$seconds" 'BEGIN {printf "%.0f", m*1000000/8*s}')
+            start_ns=$(date +%s%N)
+            curl -fsS --proxy "$PROXY" "$ORIGIN/stream?mbps=$mbps&seconds=$seconds" -o "/tmp/$name.bin"
+            end_ns=$(date +%s%N)
+            actual=$(stat -c %s "/tmp/$name.bin")
+            [ "$actual" -eq "$expected" ]
+            elapsed=$(awk -v a="$start_ns" -v b="$end_ns" 'BEGIN {printf "%.3f", (b-a)/1000000000}')
+            delivered=$(awk -v bytes="$actual" -v sec="$elapsed" 'BEGIN {printf "%.2f", bytes*8/1000000/sec}')
+            printf '%s %s\n' "$elapsed" "$delivered"
+          }
+
+          read STREAM1080_SEC STREAM1080_MBPS < <(run_stream render1080 8 15)
+          read STREAM4K_SEC STREAM4K_MBPS < <(run_stream render4k 25 15)
+
+          run_multi() {
+            local name="$1" count="$2" mbps="$3" seconds="$4"
+            local expected start_ns end_ns total elapsed delivered size
+            expected=$(awk -v m="$mbps" -v s="$seconds" 'BEGIN {printf "%.0f", m*1000000/8*s}')
+            start_ns=$(date +%s%N)
+            pids=()
+            for i in $(seq 1 "$count"); do
+              curl -fsS --proxy "$PROXY" "$ORIGIN/stream?mbps=$mbps&seconds=$seconds" -o "/tmp/$name-$i.bin" &
+              pids+=("$!")
+            done
+            for pid in "${pids[@]}"; do wait "$pid"; done
+            end_ns=$(date +%s%N)
+            total=0
+            for i in $(seq 1 "$count"); do
+              size=$(stat -c %s "/tmp/$name-$i.bin")
+              [ "$size" -eq "$expected" ]
+              total=$((total + size))
+            done
+            elapsed=$(awk -v a="$start_ns" -v b="$end_ns" 'BEGIN {printf "%.3f", (b-a)/1000000000}')
+            delivered=$(awk -v bytes="$total" -v sec="$elapsed" 'BEGIN {printf "%.2f", bytes*8/1000000/sec}')
+            printf '%s %s\n' "$elapsed" "$delivered"
+          }
+
+          read MULTI1080_SEC MULTI1080_MBPS < <(run_multi multi1080 4 8 15)
+          read MULTI4K_SEC MULTI4K_MBPS < <(run_multi multi4k 2 25 15)
+
+          : >/tmp/public_lat
+          for _ in $(seq 1 10); do latency_s "$CF_LAT" >>/tmp/public_lat; done
+          PUBLIC_LAT=$(avg_ms /tmp/public_lat)
+
+          : >/tmp/public_down
+          for _ in 1 2 3; do download_bps "$CF_DOWN" >>/tmp/public_down; done
+          PUBLIC_DOWN=$(avg_mbps /tmp/public_down)
+
+          dd if=/dev/zero of=/tmp/upload.bin bs=1M count=16 status=none
+          : >/tmp/public_up
+          for _ in 1 2; do upload_bps >>/tmp/public_up; done
+          PUBLIC_UP=$(avg_mbps /tmp/public_up)
+
+          STREAM1080_RESULT=$(awk -v e="$STREAM1080_SEC" 'BEGIN {if(e<=18.75) print "PASS"; else print "FAIL"}')
+          STREAM4K_RESULT=$(awk -v e="$STREAM4K_SEC" 'BEGIN {if(e<=18.75) print "PASS"; else print "FAIL"}')
+          MULTI1080_RESULT=$(awk -v e="$MULTI1080_SEC" 'BEGIN {if(e<=18.75) print "PASS"; else print "FAIL"}')
+          MULTI4K_RESULT=$(awk -v e="$MULTI4K_SEC" 'BEGIN {if(e<=18.75) print "PASS"; else print "FAIL"}')
+
+          cat >render-free-perf-results.md <<EOF
+          # sol Render Free resource simulation
+
+          Docker limits: 0.1 CPU, 512 MiB RAM
+
+          | Test | Result |
+          |---|---:|
+          | Local 128 MiB SOCKS/WebSocket bulk download | ${LOCAL_DOWN} Mbps |
+          | Cloudflare 32 MiB download (3-run avg) | ${PUBLIC_DOWN} Mbps |
+          | Cloudflare 16 MiB upload (2-run avg) | ${PUBLIC_UP} Mbps |
+          | Cloudflare HTTPS latency (10-run avg) | ${PUBLIC_LAT} ms |
+
+          ## Streaming-like sustained transfer
+
+          | Profile | Delivered | Completion | Result |
+          |---|---:|---:|---|
+          | 1080p synthetic, 8 Mbps | ${STREAM1080_MBPS} Mbps | ${STREAM1080_SEC} s | ${STREAM1080_RESULT} |
+          | 4K synthetic, 25 Mbps | ${STREAM4K_MBPS} Mbps | ${STREAM4K_SEC} s | ${STREAM4K_RESULT} |
+          | 4 concurrent 1080p, 32 Mbps aggregate | ${MULTI1080_MBPS} Mbps | ${MULTI1080_SEC} s | ${MULTI1080_RESULT} |
+          | 2 concurrent 4K, 50 Mbps aggregate | ${MULTI4K_MBPS} Mbps | ${MULTI4K_SEC} s | ${MULTI4K_RESULT} |
+
+          Public download bandwidth classification:
+          - 8 Mbps profile: $(profile "$PUBLIC_DOWN" 8)
+          - 25 Mbps profile: $(profile "$PUBLIC_DOWN" 25)
+          - 50 Mbps aggregate profile: $(profile "$PUBLIC_DOWN" 50)
+
+          Integrity SHA-256 direct: ${DIRECT_SHA}
+          Integrity SHA-256 tunneled: ${PROXY_SHA}
+          Integrity: PASS
+
+          Scope: CPU/RAM are constrained to current Render Free specifications, but network routing is still GitHub Actions rather than an actual Render deployment.
+          EOF
+
+          cat render-free-perf-results.md
+
+          [ "$STREAM1080_RESULT" = PASS ]
+          [ "$STREAM4K_RESULT" = PASS ]
+          [ "$MULTI1080_RESULT" = PASS ]
+          [ "$MULTI4K_RESULT" = PASS ]
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-free-perf-results
+          path: render-free-perf-results.md
