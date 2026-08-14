@@ -107,7 +107,7 @@ jobs:
           : >/tmp/local_proxy
           for _ in 1 2; do
             measure_download direct "$ORIGIN/blob?bytes=134217728" >>/tmp/local_direct
-            measure_download proxy  "$ORIGIN/blob?bytes=134217728" >>/tmp/local_proxy
+            measure_download proxy "$ORIGIN/blob?bytes=134217728" >>/tmp/local_proxy
           done
           LOCAL_DIRECT=$(avg_mbps /tmp/local_direct)
           LOCAL_PROXY=$(avg_mbps /tmp/local_proxy)
@@ -219,9 +219,9 @@ jobs:
 
           ## Integrity
 
-          32 MiB direct SHA-256: `${DIRECT_SHA}`
+          32 MiB direct SHA-256: ${DIRECT_SHA}
 
-          32 MiB SOCKS/WebSocket SHA-256: `${PROXY_SHA}`
+          32 MiB SOCKS/WebSocket SHA-256: ${PROXY_SHA}
 
           Integrity result: PASS (hashes match)
 
