@@ -53,54 +53,62 @@ jobs:
           )
           ls -lh dist
 
-      - name: Publish v0.1.0
+      - name: Publish v0.2.0
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          TAG='v0.1.0'
+          TAG='v0.2.0'
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "$TAG already exists; refusing to overwrite it."
             exit 1
           fi
 
           cat >/tmp/release-notes.md <<'EOF'
-          First standalone release of sol.
+          Optimized transport release for high-latency and unreliable mobile links.
 
-          This release contains prebuilt binaries, so Go is not required on the client machine.
+          ### Major change
 
-          Supported builds:
-          - Linux x86-64: `sol-linux-amd64`
-          - Linux ARM64: `sol-linux-arm64`
-          - Windows x86-64: `sol-windows-amd64.exe`
-          - Windows ARM64: `sol-windows-arm64.exe`
-          - macOS Intel: `sol-darwin-amd64`
-          - macOS Apple Silicon: `sol-darwin-arm64`
+          New clients keep one authenticated WSS connection open and multiplex many SOCKS5 TCP connections inside it. The configured URL may still end in `/ws`; the client automatically uses `/mux` when the updated server supports it and falls back to legacy `/ws` for older deployments.
 
-          Client usage:
+          This removes the DNS + TCP + TLS + WebSocket handshake from every browser connection. It also adds:
 
-          Linux/macOS:
+          - mux keepalives and automatic session reconnect
+          - 4 MiB per-stream receive window for high-RTT links
+          - longer TLS and connection timeouts
+          - faster IPv6-to-IPv4 fallback on broken paths
+          - TLS session resumption cache for reconnects
+          - quiet rejection of unsupported SOCKS5 UDP/BIND probes
+          - legacy `/ws` compatibility
+
+          **The server must be redeployed from this release/current main before the client can use `/mux`.**
+
+          Prebuilt binaries are included for Linux, Windows, and macOS on amd64 and arm64. Go is not required.
+
+          Linux/Android proot example:
+
           ```sh
-          chmod +x ./sol-linux-amd64
-          SOL_SERVER_URL='wss://YOUR-SERVICE.onrender.com/ws' \
+          chmod +x ./sol-linux-arm64
+          SOL_SERVER_URL='wss://your-domain.example/ws' \
           SOL_TOKEN='YOUR_SOL_TOKEN' \
-          ./sol-linux-amd64 client
+          ./sol-linux-arm64 client
           ```
 
-          Windows PowerShell:
-          ```powershell
-          $env:SOL_SERVER_URL='wss://YOUR-SERVICE.onrender.com/ws'
-          $env:SOL_TOKEN='YOUR_SOL_TOKEN'
-          .\sol-windows-amd64.exe client
+          A successful optimized connection logs:
+
+          ```text
+          optimized multiplexed tunnel connected to wss://your-domain.example/mux
           ```
 
-          The local SOCKS5 proxy listens on `127.0.0.1:1080` by default.
+          The local SOCKS5 proxy remains `127.0.0.1:1080` by default.
+
+          Note: `sol` remains TCP CONNECT only. UDP ASSOCIATE/QUIC is not implemented in v0.2.0.
 
           Verify downloads with `SHA256SUMS.txt`.
           EOF
 
           gh release create "$TAG" dist/* \
             --target "$GITHUB_SHA" \
-            --title 'sol v0.1.0' \
+            --title 'sol v0.2.0' \
             --notes-file /tmp/release-notes.md
