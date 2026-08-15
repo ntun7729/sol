@@ -1,0 +1,53 @@
+name: custom-domain-smoke
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/custom-domain-smoke.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wait for optimized server on custom domain
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://sol.huggy.bond'
+          ready=0
+          for i in $(seq 1 72); do
+            health=$(curl -sS --connect-timeout 15 --max-time 45 -o /tmp/health -w '%{http_code} %{time_total}' "$BASE/healthz" 2>/tmp/health.err || true)
+            hcode=$(awk '{print $1}' <<<"$health")
+            htime=$(awk '{print $2}' <<<"$health")
+            mux=$(curl -sS --connect-timeout 15 --max-time 45 -o /tmp/mux -w '%{http_code} %{time_total}' "$BASE/mux" 2>/tmp/mux.err || true)
+            mcode=$(awk '{print $1}' <<<"$mux")
+            mtime=$(awk '{print $2}' <<<"$mux")
+            body=$(tr -d '\r\n' </tmp/health 2>/dev/null || true)
+            echo "attempt=$i health=${hcode:-000}/${htime:-0}s body=${body:-none} mux=${mcode:-000}/${mtime:-0}s"
+            if [ "$hcode" = 200 ] && [ "$body" = ok ] && [ "$mcode" = 401 ]; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo 'Optimized /mux endpoint did not become ready on the custom domain.' >&2
+            echo 'health error:' >&2
+            cat /tmp/health.err >&2 || true
+            echo 'mux error:' >&2
+            cat /tmp/mux.err >&2 || true
+            exit 1
+          fi
+
+          : >/tmp/times
+          for _ in 1 2 3 4 5; do
+            curl -fsS --connect-timeout 15 --max-time 45 -o /dev/null -w '%{time_total}\n' "$BASE/healthz" >>/tmp/times
+          done
+          avg=$(awk '{s+=$1*1000;n++} END {printf "%.2f",s/n}' /tmp/times)
+          echo "custom-domain warm health average: ${avg} ms"
+          echo 'optimized /mux endpoint is live'
