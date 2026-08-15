@@ -1,18 +1,19 @@
 name: android-release
 
 on:
-  workflow_dispatch:
   push:
+    branches:
+      - main
     paths:
-      - '.github/workflows/android-release.yml'
+      - 'android/RELEASE_VERSION'
 
 permissions:
   contents: write
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
@@ -41,64 +42,129 @@ jobs:
       - name: Fetch pinned tun2socks source
         run: sh android/scripts/fetch-hev.sh
 
-      - name: Build SOL Android native core
+      - name: Build SOL Android native cores
         run: sh android/scripts/build-solcore.sh "$ANDROID_SDK_ROOT/ndk/27.2.12479018"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.6'
 
-      - name: Build ARM64 APK
-        run: gradle -p android --no-daemon :app:assembleRelease
+      - name: Build release, debug, and probe APKs
+        run: |
+          gradle -p android --no-daemon \
+            :app:assembleRelease \
+            :app:assembleDebug \
+            :probe:assembleDebug
 
-      - name: Package APK and checksum
+      - name: Package release and smoke-test APKs
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp android/app/build/outputs/apk/release/app-release.apk dist/sol-vpn-android-arm64-v0.1.0-beta1.apk
-          (cd dist && sha256sum sol-vpn-android-arm64-v0.1.0-beta1.apk > SHA256SUMS-android.txt)
-          ls -lh dist
+          VERSION=$(tr -d '[:space:]' < android/RELEASE_VERSION)
+          test -n "$VERSION"
+          mkdir -p dist dist-test
+          cp android/app/build/outputs/apk/release/app-release.apk "dist/sol-vpn-android-v${VERSION}.apk"
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist-test/sol-vpn-debug.apk
+          cp android/probe/build/outputs/apk/debug/probe-debug.apk dist-test/sol-vpn-probe-debug.apk
+          (cd dist && sha256sum "sol-vpn-android-v${VERSION}.apk" > SHA256SUMS-android.txt)
+          ls -lh dist dist-test
 
-      - name: Publish Android beta
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sol-vpn-android-release
+          path: dist/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sol-vpn-android-release-test-apks
+          path: dist-test/*
+          if-no-files-found: error
+
+  emulator-smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sol-vpn-android-release-test-apks
+          path: dist-test
+
+      - name: Android 14 end-to-end VPN release gate
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: bash android/scripts/emulator-smoke.sh
+
+  publish:
+    needs:
+      - build
+      - emulator-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sol-vpn-android-release
+          path: dist
+
+      - name: Publish verified Android release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          TAG='android-v0.1.0-beta1'
+          VERSION=$(tr -d '[:space:]' < android/RELEASE_VERSION)
+          TAG="android-v${VERSION}"
+          APK="sol-vpn-android-v${VERSION}.apk"
+
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "$TAG already exists; refusing to overwrite it."
             exit 1
           fi
 
-          cat >/tmp/android-release-notes.md <<'EOF'
-          First native Android VPN beta for SOL.
+          cat >/tmp/android-release-notes.md <<EOF
+          Native SOL Android VPN ${VERSION}.
 
-          What it does:
-          - Uses Android VpnService, so Termux and v2rayNG are not required.
-          - Routes device IPv4 TCP traffic through the persistent SOL /mux WebSocket transport.
-          - Handles mapped DNS inside the TUN-to-SOCKS layer so synthetic DNS addresses are restored to hostnames before reaching SOL.
-          - Keeps the SOL app itself outside the VPN route to avoid a tunnel loop.
+          Release gate passed before publication:
+          - APK installed and launched on an Android 14 emulator.
+          - The actual Connect button and Android VPN permission dialog were exercised.
+          - Both the SOL native core and TUN-to-SOCKS native engine stayed running.
+          - A separate Android probe app completed an end-to-end HTTP request through the VPN.
+          - The probe used mapped DNS and a hostname resolvable only by the SOL server side.
+          - Two disconnect/reconnect cycles completed without an app crash.
 
           Requirements:
           - Android 7.0+ (API 24+)
-          - ARM64 device
+          - ARM64 or x86_64
           - A running SOL v0.2-compatible server
 
-          Setup:
-          1. Install `sol-vpn-android-arm64-v0.1.0-beta1.apk`.
-          2. Enter your server URL such as `wss://YOUR-DOMAIN/ws`.
-          3. Enter the server's SOL token.
-          4. Tap Connect and approve Android's VPN permission dialog.
+          Current protocol limitation: SOL transports TCP only. UDP/QUIC is not tunneled.
 
-          Current limitation: SOL transports TCP only. UDP/QUIC is not tunneled in this beta, so applications need to fall back to TCP/HTTPS.
-
-          This beta is test-signed. Verify the APK with `SHA256SUMS-android.txt`.
+          This build is test-signed. Verify ${APK} with SHA256SUMS-android.txt.
           EOF
 
           gh release create "$TAG" dist/* \
             --target "$GITHUB_SHA" \
-            --title 'SOL VPN Android v0.1.0-beta1' \
+            --title "SOL VPN Android ${VERSION}" \
             --prerelease \
             --notes-file /tmp/android-release-notes.md
