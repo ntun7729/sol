@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "SolVpn"
 include(":app")
+include(":probe")
