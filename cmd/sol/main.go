@@ -27,6 +27,8 @@ const (
 	maxTargetLength     = 1024
 )
 
+var errUnsupportedSOCKSCommand = errors.New("unsupported SOCKS5 command")
+
 type connector func(context.Context, string) (net.Conn, error)
 
 type credentials struct {
@@ -83,6 +85,7 @@ func runServer() error {
 	port := envOr("PORT", defaultHTTPPort)
 	addr := "0.0.0.0:" + port
 
+	egressDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -97,7 +100,8 @@ func runServer() error {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(w, "sol tunnel\n")
 	})
-	mux.Handle("/ws", tunnelHandler(token, &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}))
+	mux.Handle("/ws", tunnelHandler(token, egressDialer))
+	mux.Handle("/mux", muxTunnelHandler(token, egressDialer))
 
 	server := &http.Server{
 		Addr:              addr,
@@ -186,14 +190,19 @@ func runClient() error {
 	}
 	defer ln.Close()
 	log.Printf("SOCKS5 client listening on %s", listen)
-	return serveSOCKS(ln, wsConnector(serverURL, token), nil)
+	return serveSOCKS(ln, optimizedConnector(serverURL, token), nil)
 }
 
 func wsConnector(serverURL, token string) connector {
+	httpClient := websocketHTTPClient()
 	return func(ctx context.Context, target string) (net.Conn, error) {
 		header := http.Header{}
 		header.Set("Authorization", "Bearer "+token)
-		ws, resp, err := websocket.Dial(ctx, serverURL, &websocket.DialOptions{HTTPHeader: header})
+		ws, resp, err := websocket.Dial(ctx, serverURL, &websocket.DialOptions{
+			HTTPClient:      httpClient,
+			HTTPHeader:      header,
+			CompressionMode: websocket.CompressionDisabled,
+		})
 		if err != nil {
 			if resp != nil {
 				return nil, fmt.Errorf("websocket dial failed with HTTP %d: %w", resp.StatusCode, err)
@@ -251,7 +260,7 @@ func serveSOCKS(ln net.Listener, connect connector, creds *credentials) error {
 		}
 		go func() {
 			defer conn.Close()
-			if err := handleSOCKS(conn, connect, creds); err != nil {
+			if err := handleSOCKS(conn, connect, creds); err != nil && !errors.Is(err, errUnsupportedSOCKSCommand) {
 				log.Printf("SOCKS5 connection: %v", err)
 			}
 		}()
@@ -259,7 +268,7 @@ func serveSOCKS(ln net.Listener, connect connector, creds *credentials) error {
 }
 
 func handleSOCKS(client net.Conn, connect connector, creds *credentials) error {
-	_ = client.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = client.SetDeadline(time.Now().Add(45 * time.Second))
 	if err := negotiateSOCKS(client, creds); err != nil {
 		return err
 	}
@@ -268,7 +277,7 @@ func handleSOCKS(client net.Conn, connect connector, creds *credentials) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 	remote, err := connect(ctx, target)
 	if err != nil {
@@ -354,7 +363,7 @@ func readSOCKSRequest(conn net.Conn) (string, error) {
 	}
 	if req[1] != 0x01 {
 		_ = writeSOCKSReply(conn, 0x07)
-		return "", errors.New("only SOCKS5 CONNECT is supported")
+		return "", errUnsupportedSOCKSCommand
 	}
 
 	var host string
