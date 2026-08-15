@@ -1,3 +1,5 @@
+//go:build android
+
 #include <jni.h>
 
 extern int sol_start(char *server_url, char *token);
