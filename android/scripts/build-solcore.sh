@@ -19,6 +19,7 @@ OUT="$ROOT/android/app/src/main/jniLibs/arm64-v8a"
 mkdir -p "$OUT"
 
 cd "$ROOT"
+go mod tidy
 CGO_ENABLED=1 \
 GOOS=android \
 GOARCH=arm64 \
