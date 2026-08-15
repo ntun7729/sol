@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -84,14 +85,27 @@ func optimizedMuxURL(serverURL string) (string, error) {
 func websocketHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DialContext = (&net.Dialer{
-		Timeout:   20 * time.Second,
-		KeepAlive: 30 * time.Second,
+		Timeout:       20 * time.Second,
+		KeepAlive:     30 * time.Second,
+		FallbackDelay: 200 * time.Millisecond,
 	}).DialContext
 	transport.ForceAttemptHTTP2 = false
 	transport.TLSHandshakeTimeout = 30 * time.Second
 	transport.ResponseHeaderTimeout = 30 * time.Second
 	transport.IdleConnTimeout = 90 * time.Second
+	transport.MaxIdleConns = 16
 	transport.MaxIdleConnsPerHost = 4
+
+	tlsConfig := transport.TLSClientConfig
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{}
+	} else {
+		tlsConfig = tlsConfig.Clone()
+	}
+	tlsConfig.MinVersion = tls.VersionTLS12
+	tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(64)
+	transport.TLSClientConfig = tlsConfig
+
 	return &http.Client{Transport: transport}
 }
 
