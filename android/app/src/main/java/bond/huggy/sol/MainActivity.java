@@ -34,6 +34,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         buildUi();
+        applyDebugInputs();
         requestNotificationPermissionIfNeeded();
     }
 
@@ -113,6 +114,21 @@ public class MainActivity extends Activity {
         root.addView(statusView, matchWrap());
 
         setContentView(scroll);
+    }
+
+    private void applyDebugInputs() {
+        if (!BuildConfig.DEBUG) {
+            return;
+        }
+        Intent intent = getIntent();
+        String server = intent.getStringExtra("debug_server");
+        String token = intent.getStringExtra("debug_token");
+        if (server != null) {
+            serverField.setText(server);
+        }
+        if (token != null) {
+            tokenField.setText(token);
+        }
     }
 
     private void onActionClicked(View ignored) {
