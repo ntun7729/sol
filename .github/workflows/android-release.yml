@@ -103,6 +103,15 @@ jobs:
           name: sol-vpn-android-release-test-apks
           path: dist-test
 
+      - name: Enable KVM for emulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            ls -l /dev/kvm
+          fi
+
       - name: Android 14 end-to-end VPN release gate
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -111,7 +120,7 @@ jobs:
           arch: x86_64
           profile: pixel_6
           disable-animations: true
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -no-metrics
           script: bash android/scripts/emulator-smoke.sh
 
   publish:
