@@ -7,6 +7,10 @@ android {
     compileSdk 34
     ndkVersion '27.2.12479018'
 
+    buildFeatures {
+        buildConfig true
+    }
+
     defaultConfig {
         applicationId 'bond.huggy.sol'
         minSdk 24
