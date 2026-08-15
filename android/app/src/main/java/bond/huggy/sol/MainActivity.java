@@ -105,6 +105,7 @@ public class MainActivity extends Activity {
         root.addView(note, matchWrap());
 
         actionButton = new Button(this);
+        actionButton.setId(R.id.connect_button);
         actionButton.setOnClickListener(this::onActionClicked);
         root.addView(actionButton, matchWrap());
 
