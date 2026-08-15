@@ -14,6 +14,11 @@ cleanup() {
 trap cleanup EXIT
 
 fail_with_logs() {
+    echo '--- current Android UI ---'
+    if adb get-state >/dev/null 2>&1; then
+        adb shell uiautomator dump /sdcard/sol-failure.xml >/dev/null 2>&1 || true
+        adb shell cat /sdcard/sol-failure.xml 2>/dev/null || true
+    fi
     echo '--- SOL server log ---'
     cat /tmp/sol-ci-server.log 2>/dev/null || true
     echo '--- target server log ---'
@@ -45,7 +50,10 @@ root = ET.parse('/tmp/sol-window.xml').getroot()
 for node in root.iter('node'):
     text = node.attrib.get('text', '')
     resource_id = node.attrib.get('resource-id', '')
-    matched = (mode == 'text' and text == value) or (mode == 'resource-suffix' and resource_id.endswith(value))
+    if mode == 'text':
+        matched = text.strip().casefold() == value.strip().casefold()
+    else:
+        matched = mode == 'resource-suffix' and resource_id.endswith(value)
     if not matched:
         continue
     bounds = node.attrib.get('bounds', '')
@@ -57,7 +65,11 @@ for node in root.iter('node'):
     raise SystemExit(0)
 raise SystemExit(1)
 PY
-) || return 1
+) || {
+        echo "Could not find UI node: mode=$mode value=$value" >&2
+        cat /tmp/sol-window.xml >&2 || true
+        return 1
+    }
     adb shell input tap $coords
 }
 
@@ -109,8 +121,6 @@ echo 'SOL_VPN_E2E_OK' >/tmp/sol-ci-target/index.html
 python3 -m http.server 18080 --bind 127.0.0.1 --directory /tmp/sol-ci-target >/tmp/sol-ci-target.log 2>&1 &
 TARGET_PID=$!
 
-# The executable lives under cmd/sol. Resolve modules in this fresh workflow
-# job before building the local server used by the emulator test.
 go mod tidy
 go build -o /tmp/sol-ci ./cmd/sol
 SOL_TOKEN="$TOKEN" PORT=10000 /tmp/sol-ci server >/tmp/sol-ci-server.log 2>&1 &
@@ -135,13 +145,11 @@ adb shell am start -W \
     --es debug_server "$SERVER_URL" \
     --es debug_token "$TOKEN" >/dev/null
 
-# The activity itself loads libsolcore. Loading TProxyService also loads
-# hev-socks5-tunnel and exercises its JNI_OnLoad registration.
 wait_status 'solAvailable=true,solRunning=false,tproxyAvailable=true,tproxyRunning=false' || fail_with_logs
 
-# Exercise the same user path that previously crashed: tap Connect, approve the
-# Android system VPN dialog, then require both native engines to stay alive.
-tap_node text Connect || fail_with_logs
+# Exercise the same user path that previously crashed: tap the real Connect
+# button, approve Android's VPN dialog, then require both native engines alive.
+tap_node resource-suffix 'connect_button' || fail_with_logs
 sleep 1
 if ! tap_node resource-suffix 'button_start_vpn'; then
     tap_node resource-suffix 'button1' || fail_with_logs
@@ -149,25 +157,23 @@ fi
 wait_status 'solAvailable=true,solRunning=true,tproxyAvailable=true,tproxyRunning=true' || fail_with_logs
 
 # End-to-end proof from a different Android UID. The hostname exists only in
-# the GitHub runner's /etc/hosts, so this succeeds only if mapped DNS is restored
-# to a hostname and the TCP request reaches the runner through SOL.
+# the GitHub runner's /etc/hosts, so this proves mapped DNS is converted back to
+# a hostname and the TCP request exits via the SOL server.
 run_probe || fail_with_logs
 
-# Exercise teardown and reconnect twice. This catches JNI/thread lifecycle bugs
-# that a one-shot startup check misses.
+# Exercise teardown and reconnect twice. After the first Android VPN approval,
+# reconnects should no longer show the system confirmation dialog.
 for cycle in 1 2; do
     echo "Reconnect cycle $cycle"
-    tap_node text Disconnect || fail_with_logs
+    tap_node resource-suffix 'connect_button' || fail_with_logs
     wait_status 'solAvailable=true,solRunning=false,tproxyAvailable=true,tproxyRunning=false' || fail_with_logs
-    tap_node text Connect || fail_with_logs
+    tap_node resource-suffix 'connect_button' || fail_with_logs
     wait_status 'solAvailable=true,solRunning=true,tproxyAvailable=true,tproxyRunning=true' || fail_with_logs
     run_probe || fail_with_logs
 done
 
-# The app process must still be alive after the repeated connect/disconnect path.
 adb shell pidof bond.huggy.sol >/dev/null || fail_with_logs
 
-# Any app crash in the dedicated emulator is a hard failure.
 if adb logcat -d -b crash | grep -q 'bond.huggy.sol'; then
     fail_with_logs
 fi
