@@ -4,12 +4,15 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
+import android.util.Log;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -22,22 +25,52 @@ public class TProxyService extends VpnService {
     public static final String EXTRA_SERVER_URL = "server_url";
     public static final String EXTRA_TOKEN = "token";
 
+    private static final String TAG = "SolVpnService";
     private static final String CHANNEL_ID = "sol_vpn";
     private static final int NOTIFICATION_ID = 1001;
     private static final String MAPPED_DNS = "198.18.0.2";
+    private static final String PREFS = "sol_vpn";
+    private static final String PREF_LAST_ERROR = "last_error";
 
     private static native boolean TProxyStartService(String configPath, int fd);
     private static native boolean TProxyStopService();
     private static native boolean TProxyIsRunning();
+    // hev-socks5-tunnel registers all four methods from its JNI_OnLoad. This
+    // declaration is required even though the UI does not currently show stats.
+    private static native long[] TProxyGetStats();
+
+    private static final boolean tProxyNativeAvailable;
+    private static final String tProxyNativeLoadError;
 
     static {
-        System.loadLibrary("hev-socks5-tunnel");
+        boolean available = false;
+        String error = "";
+        try {
+            System.loadLibrary("hev-socks5-tunnel");
+            available = true;
+        } catch (Throwable t) {
+            error = t.toString();
+            Log.e(TAG, "Unable to load TUN-to-SOCKS native library", t);
+        }
+        tProxyNativeAvailable = available;
+        tProxyNativeLoadError = error;
     }
 
     private ParcelFileDescriptor tunFd;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        try {
+            return handleStartCommand(intent);
+        } catch (Throwable t) {
+            recordError("VPN service failed: " + safeMessage(t));
+            Log.e(TAG, "Unhandled VPN startup failure", t);
+            stopTunnel();
+            return START_NOT_STICKY;
+        }
+    }
+
+    private int handleStartCommand(Intent intent) {
         if (intent == null) {
             return START_NOT_STICKY;
         }
@@ -52,10 +85,12 @@ public class TProxyService extends VpnService {
         String serverUrl = intent.getStringExtra(EXTRA_SERVER_URL);
         String token = intent.getStringExtra(EXTRA_TOKEN);
         if (serverUrl == null || token == null) {
+            recordError("Missing server URL or SOL token");
             stopSelf();
             return START_NOT_STICKY;
         }
 
+        clearLastError(this);
         startForegroundNow();
         if (!startTunnel(serverUrl.trim(), token.trim())) {
             stopTunnel();
@@ -76,13 +111,22 @@ public class TProxyService extends VpnService {
         super.onDestroy();
     }
 
-    private boolean startTunnel(String serverUrl, String token) {
-        if (tunFd != null && TProxyIsRunning() && SolCore.nativeIsRunning()) {
+    private synchronized boolean startTunnel(String serverUrl, String token) {
+        if (tunFd != null && isTProxyRunningSafe() && SolCore.isRunning()) {
             return true;
         }
+        if (!tProxyNativeAvailable) {
+            recordError("TUN native library failed to load: " + tProxyNativeLoadError);
+            return false;
+        }
+        if (!SolCore.isAvailable()) {
+            recordError("SOL native library failed to load: " + SolCore.getLoadError());
+            return false;
+        }
 
-        int solResult = SolCore.nativeStart(serverUrl, token);
+        int solResult = SolCore.start(serverUrl, token);
         if (solResult != 0) {
+            recordError("SOL core could not start (code " + solResult + ")");
             return false;
         }
 
@@ -99,14 +143,16 @@ public class TProxyService extends VpnService {
         // by its own VPN and avoids a routing loop.
         try {
             builder.addDisallowedApplication(getPackageName());
-        } catch (PackageManager.NameNotFoundException ignored) {
-            SolCore.nativeStop();
+        } catch (PackageManager.NameNotFoundException e) {
+            recordError("Unable to exclude SOL from its own VPN route");
+            SolCore.stop();
             return false;
         }
 
         tunFd = builder.establish();
         if (tunFd == null) {
-            SolCore.nativeStop();
+            recordError("Android refused to create the VPN interface");
+            SolCore.stop();
             return false;
         }
 
@@ -132,26 +178,44 @@ public class TProxyService extends VpnService {
         try (FileOutputStream out = new FileOutputStream(config, false)) {
             out.write(yaml.getBytes(StandardCharsets.UTF_8));
         } catch (IOException e) {
+            recordError("Unable to write VPN configuration: " + safeMessage(e));
             closeTun();
-            SolCore.nativeStop();
+            SolCore.stop();
             return false;
         }
 
-        if (!TProxyStartService(config.getAbsolutePath(), tunFd.getFd())) {
+        try {
+            if (!TProxyStartService(config.getAbsolutePath(), tunFd.getFd())) {
+                recordError("TUN-to-SOCKS engine could not start");
+                closeTun();
+                SolCore.stop();
+                return false;
+            }
+        } catch (Throwable t) {
+            recordError("TUN-to-SOCKS engine failed: " + safeMessage(t));
+            Log.e(TAG, "TUN-to-SOCKS start failure", t);
             closeTun();
-            SolCore.nativeStop();
+            SolCore.stop();
             return false;
         }
         return true;
     }
 
-    private void stopTunnel() {
-        if (TProxyIsRunning()) {
-            TProxyStopService();
+    private synchronized void stopTunnel() {
+        if (isTProxyRunningSafe()) {
+            try {
+                TProxyStopService();
+            } catch (Throwable t) {
+                Log.e(TAG, "TUN-to-SOCKS stop failure", t);
+            }
         }
         closeTun();
-        SolCore.nativeStop();
-        stopForeground(true);
+        SolCore.stop();
+        try {
+            stopForeground(true);
+        } catch (Throwable t) {
+            Log.w(TAG, "Unable to stop foreground notification", t);
+        }
         stopSelf();
     }
 
@@ -168,6 +232,9 @@ public class TProxyService extends VpnService {
 
     private void startForegroundNow() {
         NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager == null) {
+            throw new IllegalStateException("NotificationManager unavailable");
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
                     CHANNEL_ID,
@@ -203,5 +270,48 @@ public class TProxyService extends VpnService {
         } else {
             startForeground(NOTIFICATION_ID, notification);
         }
+    }
+
+    private boolean isTProxyRunningSafe() {
+        return isTProxyNativeRunning();
+    }
+
+    static boolean isTProxyNativeAvailable() {
+        return tProxyNativeAvailable;
+    }
+
+    static boolean isTProxyNativeRunning() {
+        if (!tProxyNativeAvailable) {
+            return false;
+        }
+        try {
+            return TProxyIsRunning();
+        } catch (Throwable t) {
+            Log.e(TAG, "TUN native status failed", t);
+            return false;
+        }
+    }
+
+    static String getLastError(Context context) {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(PREF_LAST_ERROR, "");
+    }
+
+    static void clearLastError(Context context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .remove(PREF_LAST_ERROR)
+                .apply();
+    }
+
+    private void recordError(String message) {
+        SharedPreferences prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        prefs.edit().putString(PREF_LAST_ERROR, message).apply();
+        Log.e(TAG, message);
+    }
+
+    private static String safeMessage(Throwable t) {
+        String message = t.getMessage();
+        return message == null || message.isEmpty() ? t.getClass().getSimpleName() : message;
     }
 }
