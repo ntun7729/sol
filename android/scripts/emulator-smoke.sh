@@ -30,9 +30,42 @@ fail_with_logs() {
     exit 1
 }
 
-ui_dump() {
+raw_ui_dump() {
     adb shell uiautomator dump /sdcard/sol-window.xml >/dev/null
     adb pull /sdcard/sol-window.xml /tmp/sol-window.xml >/dev/null
+}
+
+dismiss_emulator_launcher_anr() {
+    local attempt coords
+    for attempt in 1 2 3; do
+        raw_ui_dump || return 0
+        if ! grep -qi "Pixel Launcher isn't responding" /tmp/sol-window.xml; then
+            return 0
+        fi
+        echo 'Dismissing unrelated Pixel Launcher ANR from emulator'
+        coords=$(python3 <<'PY'
+import re
+import xml.etree.ElementTree as ET
+root = ET.parse('/tmp/sol-window.xml').getroot()
+for node in root.iter('node'):
+    if not node.attrib.get('resource-id', '').endswith('aerr_close'):
+        continue
+    m = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.attrib.get('bounds', ''))
+    if m:
+        x1, y1, x2, y2 = map(int, m.groups())
+        print((x1 + x2) // 2, (y1 + y2) // 2)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+) || return 0
+        adb shell input tap $coords
+        sleep 1
+    done
+}
+
+ui_dump() {
+    dismiss_emulator_launcher_anr
+    raw_ui_dump
 }
 
 tap_node() {
@@ -115,6 +148,13 @@ if [ ! -f "$APP_APK" ] || [ ! -f "$PROBE_APK" ]; then
     exit 2
 fi
 
+# Hosted Android emulators occasionally surface a Pixel Launcher ANR even when
+# the test app is healthy. Suppress/dismiss only that unrelated system noise;
+# SOL crashes remain fatal and are checked explicitly below.
+adb shell settings put global hide_error_dialogs 1 2>/dev/null || true
+adb shell am force-stop com.google.android.apps.nexuslauncher 2>/dev/null || true
+dismiss_emulator_launcher_anr || true
+
 sudo sh -c "grep -q 'sol-ci-target.invalid' /etc/hosts || echo '127.0.0.1 sol-ci-target.invalid' >> /etc/hosts"
 mkdir -p /tmp/sol-ci-target
 echo 'SOL_VPN_E2E_OK' >/tmp/sol-ci-target/index.html
@@ -144,11 +184,11 @@ adb shell am start -W \
     -n bond.huggy.sol/.MainActivity \
     --es debug_server "$SERVER_URL" \
     --es debug_token "$TOKEN" >/dev/null
+sleep 1
+dismiss_emulator_launcher_anr || true
 
 wait_status 'solAvailable=true,solRunning=false,tproxyAvailable=true,tproxyRunning=false' || fail_with_logs
 
-# Exercise the same user path that previously crashed: tap the real Connect
-# button, approve Android's VPN dialog, then require both native engines alive.
 tap_node resource-suffix 'connect_button' || fail_with_logs
 sleep 1
 if ! tap_node resource-suffix 'button_start_vpn'; then
@@ -156,13 +196,8 @@ if ! tap_node resource-suffix 'button_start_vpn'; then
 fi
 wait_status 'solAvailable=true,solRunning=true,tproxyAvailable=true,tproxyRunning=true' || fail_with_logs
 
-# End-to-end proof from a different Android UID. The hostname exists only in
-# the GitHub runner's /etc/hosts, so this proves mapped DNS is converted back to
-# a hostname and the TCP request exits via the SOL server.
 run_probe || fail_with_logs
 
-# Exercise teardown and reconnect twice. After the first Android VPN approval,
-# reconnects should no longer show the system confirmation dialog.
 for cycle in 1 2; do
     echo "Reconnect cycle $cycle"
     tap_node resource-suffix 'connect_button' || fail_with_logs
