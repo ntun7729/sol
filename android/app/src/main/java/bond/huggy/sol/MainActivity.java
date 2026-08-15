@@ -48,6 +48,8 @@ public class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == VPN_PERMISSION_REQUEST && resultCode == RESULT_OK) {
             startVpn();
+        } else if (requestCode == VPN_PERMISSION_REQUEST) {
+            statusView.setText("VPN permission was not granted");
         }
     }
 
@@ -114,12 +116,25 @@ public class MainActivity extends Activity {
     }
 
     private void onActionClicked(View ignored) {
-        if (SolCore.nativeIsRunning()) {
-            Intent stop = new Intent(this, TProxyService.class);
-            stop.setAction(TProxyService.ACTION_DISCONNECT);
-            startService(stop);
-            statusView.setText("Disconnecting…");
-            actionButton.postDelayed(this::refreshState, 500);
+        if (SolCore.isRunning()) {
+            try {
+                Intent stop = new Intent(this, TProxyService.class);
+                stop.setAction(TProxyService.ACTION_DISCONNECT);
+                startService(stop);
+                statusView.setText("Disconnecting…");
+                actionButton.postDelayed(this::refreshState, 500);
+            } catch (Throwable t) {
+                showFailure("Unable to disconnect: " + safeMessage(t));
+            }
+            return;
+        }
+
+        if (!SolCore.isAvailable()) {
+            showFailure("SOL native core is unavailable: " + SolCore.getLoadError());
+            return;
+        }
+        if (!TProxyService.isTProxyNativeAvailable()) {
+            showFailure("VPN native engine is unavailable");
             return;
         }
 
@@ -139,12 +154,17 @@ public class MainActivity extends Activity {
                 .putString(PREF_SERVER, server)
                 .putString(PREF_TOKEN, token)
                 .apply();
+        TProxyService.clearLastError(this);
 
-        Intent prepare = VpnService.prepare(this);
-        if (prepare != null) {
-            startActivityForResult(prepare, VPN_PERMISSION_REQUEST);
-        } else {
-            startVpn();
+        try {
+            Intent prepare = VpnService.prepare(this);
+            if (prepare != null) {
+                startActivityForResult(prepare, VPN_PERMISSION_REQUEST);
+            } else {
+                startVpn();
+            }
+        } catch (Throwable t) {
+            showFailure("Unable to request VPN permission: " + safeMessage(t));
         }
     }
 
@@ -155,23 +175,38 @@ public class MainActivity extends Activity {
         intent.setAction(TProxyService.ACTION_CONNECT);
         intent.putExtra(TProxyService.EXTRA_SERVER_URL, server);
         intent.putExtra(TProxyService.EXTRA_TOKEN, token);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent);
-        } else {
-            startService(intent);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+            statusView.setText("Starting…");
+            actionButton.postDelayed(this::refreshState, 900);
+        } catch (Throwable t) {
+            showFailure("Unable to start VPN service: " + safeMessage(t));
         }
-        statusView.setText("Starting…");
-        actionButton.postDelayed(this::refreshState, 700);
     }
 
     private void refreshState() {
-        boolean running = SolCore.nativeIsRunning();
+        boolean running = SolCore.isRunning() && TProxyService.isTProxyNativeRunning();
         actionButton.setText(running ? "Disconnect" : "Connect");
-        statusView.setText(running
-                ? "Connected — Android traffic is routed through SOL"
-                : "Disconnected");
+
+        String lastError = TProxyService.getLastError(this);
+        if (running) {
+            statusView.setText("Connected — Android traffic is routed through SOL");
+        } else if (lastError != null && !lastError.isEmpty()) {
+            statusView.setText("Connection failed — " + lastError);
+        } else {
+            statusView.setText("Disconnected");
+        }
         serverField.setEnabled(!running);
         tokenField.setEnabled(!running);
+    }
+
+    private void showFailure(String message) {
+        statusView.setText(message);
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
 
     private void requestNotificationPermissionIfNeeded() {
@@ -191,5 +226,10 @@ public class MainActivity extends Activity {
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private static String safeMessage(Throwable t) {
+        String message = t.getMessage();
+        return message == null || message.isEmpty() ? t.getClass().getSimpleName() : message;
     }
 }
