@@ -109,18 +109,21 @@ echo 'SOL_VPN_E2E_OK' >/tmp/sol-ci-target/index.html
 python3 -m http.server 18080 --bind 127.0.0.1 --directory /tmp/sol-ci-target >/tmp/sol-ci-target.log 2>&1 &
 TARGET_PID=$!
 
-go build -o /tmp/sol-ci .
+# The executable lives under cmd/sol. Resolve modules in this fresh workflow
+# job before building the local server used by the emulator test.
+go mod tidy
+go build -o /tmp/sol-ci ./cmd/sol
 SOL_TOKEN="$TOKEN" PORT=10000 /tmp/sol-ci server >/tmp/sol-ci-server.log 2>&1 &
 SOL_PID=$!
 
 for _ in $(seq 1 30); do
-    if curl -fsS http://127.0.0.1:10000/healthz >/dev/null; then
+    if curl --noproxy '*' -fsS http://127.0.0.1:10000/healthz >/dev/null; then
         break
     fi
     sleep 1
 done
-curl -fsS http://127.0.0.1:10000/healthz >/dev/null || fail_with_logs
-curl -fsS http://sol-ci-target.invalid:18080/ | grep -q 'SOL_VPN_E2E_OK' || fail_with_logs
+curl --noproxy '*' -fsS http://127.0.0.1:10000/healthz >/dev/null || fail_with_logs
+curl --noproxy '*' -fsS http://sol-ci-target.invalid:18080/ | grep -q 'SOL_VPN_E2E_OK' || fail_with_logs
 
 adb install -r "$APP_APK" >/dev/null
 adb install -r "$PROBE_APK" >/dev/null
